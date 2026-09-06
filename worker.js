@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
-const APP_BUILD = "2026-08-17-cache-safe-1";
+const APP_BUILD = "2026-09-06-online-stability-1";
 const ONLINE_PROTOCOL = "exact-1v1-v4";
 
 const EMPTY_ROOM_TTL_MS = 30 * 60 * 1000;
@@ -60,7 +60,11 @@ function json(data,status=200,extraHeaders={}){
   });
 }
 function clone(v){return v==null?v:JSON.parse(JSON.stringify(v))}
-function clamp(v,a,b){return Math.max(a,Math.min(b,Number(v)))}
+function clamp(v,a,b){
+  const n=Number(v);
+  if(v==null||typeof v==='boolean'||typeof v==='object'||v===''||!Number.isFinite(n))throw new Error('Некорректное числовое значение');
+  return Math.max(a,Math.min(b,n));
+}
 function opponent(side){return side==="red"?"blue":"red"}
 function cfg(s){return FORMAT_CONFIGS[s.matchFormat]||FORMAT_CONFIGS.individual}
 function sideBoxes(s,side){return side==="red"?cfg(s).redBoxes:cfg(s).blueBoxes}
@@ -175,7 +179,7 @@ function createInitialState(config){
   setPhysicsProfile(config?.physicsProfile);
   const format="individual";
   const s={
-    version:30,revision:0,matchFormat:"individual",
+    version:30,revision:0,matchId:crypto.randomUUID(),matchFormat:"individual",
     fieldOrientation:config.fieldOrientation==="horizontal"?"horizontal":"vertical",
     realisticMode:!!config.realisticMode,
     physicsProfile:clone(config.physicsProfile||{w:288,h:600,r:Math.max(7.8,Math.min(12.5,288*.032))}),
@@ -771,7 +775,11 @@ export class BocciaRoom extends DurableObject {
     return new Response(null,{status:101,webSocket:client});
   }
   async getSeats(){return(await this.ctx.storage.get("seats"))||{red:null,blue:null}}
-  async getState(){return(await this.ctx.storage.get("gameState"))||null}
+  async getState(){
+    const state=(await this.ctx.storage.get("gameState"))||null;
+    if(state&&!state.matchId){state.matchId=crypto.randomUUID();await this.ctx.storage.put("gameState",state)}
+    return state;
+  }
   async getRevision(){return Number((await this.ctx.storage.get("revision"))||0)}
   async getConfig(){return(await this.ctx.storage.get("config"))||{
     matchFormat:"individual",
@@ -811,6 +819,10 @@ export class BocciaRoom extends DurableObject {
     if(await this.processed(actionId)){await this.sendSnapshot(ws,{ackActionId:actionId});return}
     const state=await this.getState();
     if(!state){ws.send(JSON.stringify({type:"action_error",protocol:ONLINE_PROTOCOL,build:APP_BUILD,message:"Матч ещё не запущен",ackActionId:actionId,revision:await this.getRevision(),state:null}));return}
+    if(data.matchId!==state.matchId||data.expectedRevision!==await this.getRevision()){
+      ws.send(JSON.stringify({type:"action_error",protocol:ONLINE_PROTOCOL,build:APP_BUILD,message:"Состояние обновилось. Повтори действие.",ackActionId:actionId,revision:await this.getRevision(),state}));
+      return;
+    }
     let next=clone(state);
     let animation=null;
     let events=[];
@@ -856,19 +868,26 @@ export class BocciaRoom extends DurableObject {
     let data;try{data=JSON.parse(message)}catch{return}
     let player=this.sessions.get(ws)||ws.deserializeAttachment()||{id:crypto.randomUUID(),clientKey:null,side:null,ready:false};
 
+    if(!data||typeof data!=="object")return;
     if(data.type==="join"){
+      if(data.protocol!==ONLINE_PROTOCOL||data.build!==APP_BUILD){
+        ws.send(JSON.stringify({type:"room_state",protocol:ONLINE_PROTOCOL,build:APP_BUILD}));
+        return;
+      }
       const clientKey=String(data.clientKey||"").slice(0,160);if(!clientKey)return;
       const seats=await this.getSeats();let side=null;
       if(seats.red?.clientKey===clientKey)side="red";else if(seats.blue?.clientKey===clientKey)side="blue";
       else if(!seats.red){side="red";seats.red={clientKey,ready:false}}else if(!seats.blue){side="blue";seats.blue={clientKey,ready:false}}
       else{ws.send(JSON.stringify({type:"room_full",protocol:ONLINE_PROTOCOL,build:APP_BUILD}));return}
-      for(const[otherWs,other]of this.sessions.entries())if(otherWs!==ws&&other.clientKey&&other.clientKey===clientKey){this.sessions.delete(otherWs);try{otherWs.close(1012,"reconnected")}catch{}}
+      for(const[otherWs,other]of this.sessions.entries())if(otherWs!==ws&&other.clientKey&&other.clientKey===clientKey){this.sessions.delete(otherWs);try{otherWs.close(4001,"reconnected")}catch{}}
       player={id:crypto.randomUUID(),clientKey,side,ready:!!seats[side]?.ready};seats[side]={clientKey,ready:player.ready};
       await this.ctx.storage.put("seats",seats);ws.serializeAttachment(player);this.sessions.set(ws,player);await this.ctx.storage.deleteAlarm();
       ws.send(JSON.stringify({type:"joined",protocol:ONLINE_PROTOCOL,build:APP_BUILD,playerId:player.id,side:player.side,ready:player.ready,revision:await this.getRevision(),state:await this.getState(),players:await this.playerList(),config:await this.getConfig()}));
       await this.broadcastRoomState();return;
     }
-    if(!player.side)return;
+    if(!player.side||!this.sessions.has(ws))return;
+    const activeSeats=await this.getSeats();
+    if(activeSeats[player.side]?.clientKey!==player.clientKey)return;
     if(data.type==="sync"){await this.sendSnapshot(ws);return}
     if(data.type==="ready"){
       const actionId=String(data.actionId||"");if(!actionId)return;
@@ -880,7 +899,11 @@ export class BocciaRoom extends DurableObject {
     }
     if(["throw","select_player","select_ball","set_launcher","decline"].includes(data.type)){await this.applyGameAction(ws,player,data);return}
     if(data.type==="restart"){
-      const actionId=String(data.actionId||"");await this.ctx.storage.delete("gameState");await this.ctx.storage.put("revision",0);await this.ctx.storage.put("processedActions",[]);
+      const actionId=String(data.actionId||"");
+      if(!actionId||await this.processed(actionId))return;
+      const state=await this.getState();
+      if(!state||data.matchId!==state.matchId){await this.sendSnapshot(ws,{ackActionId:actionId});return}
+      await this.ctx.storage.delete("gameState");await this.ctx.storage.put("revision",0);await this.ctx.storage.put("processedActions",[]);await this.rememberAction(actionId);
       const seats=await this.getSeats();if(seats.red)seats.red.ready=false;if(seats.blue)seats.blue.ready=false;await this.ctx.storage.put("seats",seats);
       for(const[socket,p]of this.sessions.entries()){p.ready=false;socket.serializeAttachment(p);this.sessions.set(socket,p)}
       await this.broadcast({type:"restart",protocol:ONLINE_PROTOCOL,build:APP_BUILD,ackActionId:actionId||null});await this.broadcastRoomState();return;
