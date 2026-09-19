@@ -26,6 +26,10 @@ function roomCodeFromPath(pathname,prefix){
   return (rest.split("/")[0]||"").toUpperCase().replace(/[^A-Z0-9]/g,"");
 }
 
+async function creationKey(clientKey,requestId,attempt){
+  const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify([clientKey,requestId,attempt])));
+  return Array.from(new Uint8Array(bytes),b=>b.toString(16).padStart(2,'0')).join('');
+}
 export default {
   async fetch(request,env){
     const url=new URL(request.url);
@@ -58,6 +62,7 @@ export default {
       const clientKey=String(url.searchParams.get("clientKey")||"").slice(0,160);
       if(!clientKey)return transportJson({error:"clientKey required"},400);
 
+      const requestId=String(url.searchParams.get("requestId")||"").slice(0,160);
       const pw=Number(url.searchParams.get("physicsW"));
       const ph=Number(url.searchParams.get("physicsH"));
       const pr=Number(url.searchParams.get("physicsR"));
@@ -74,15 +79,21 @@ export default {
       };
 
       for(let attempt=0;attempt<12;attempt++){
-        const code=makeRoomCode();
+        const creationId=requestId?await creationKey(clientKey,requestId,attempt):null;
+        const alphabet='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        const code=creationId?Array.from({length:8},(_,i)=>alphabet[parseInt(creationId.slice(i*2,i*2+2),16)%32]).join(''):makeRoomCode();
         const id=env.BOCCIA_ROOMS.idFromName(code);
         const stub=env.BOCCIA_ROOMS.get(id);
         const init=await stub.fetch(new Request("https://room.internal/init",{
           method:"POST",
           headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({code,clientKey,config})
+          body:JSON.stringify({code,clientKey,config,creationId})
         }));
 
+        if(init.status===200){
+          const saved=await init.json();
+          return transportJson({code,config:saved.config,build:APP_BUILD,protocol:ONLINE_PROTOCOL},200);
+        }
         if(init.status===201){
           return transportJson({code,config,build:APP_BUILD,protocol:ONLINE_PROTOCOL},201);
         }
@@ -150,3 +161,4 @@ export default {
     return new Response("Not found",{status:404,headers:transportCors()});
   }
 };
+

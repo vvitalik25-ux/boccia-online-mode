@@ -10,6 +10,7 @@ const HTTP_CONNECTED_MS=15000;
 export class BocciaRoom extends DurableObject {
   constructor(ctx,env){
     super(ctx,env);
+    this.commandQueue=Promise.resolve();
     this.sessions=new Map();
     this.httpPresence=new Map();
     this.lastReplayPayload=null;
@@ -23,13 +24,20 @@ export class BocciaRoom extends DurableObject {
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping","pong"));
   }
 
-  async fetch(request){
+  serialize(task){
+    const work=this.commandQueue.then(task);this.commandQueue=work.catch(()=>{});return work;
+  }
+  fetch(request){return this.serialize(()=>this.handleRequest(request));}
+  async handleRequest(request){
     const url=new URL(request.url);
 
     if(url.pathname==="/init"&&request.method==="POST"){
-      if(await this.ctx.storage.get("createdAt"))return new Response("exists",{status:409});
-
       const body=await request.json();
+      if(await this.ctx.storage.get('createdAt')){
+        if(body.creationId&&body.creationId===await this.ctx.storage.get('creationId'))return json({config:await this.getConfig()});
+        return new Response('exists',{status:409});
+      }
+      if(body.creationId)await this.ctx.storage.put('creationId',body.creationId);
       const config={
         matchFormat:"individual",
         fieldOrientation:body?.config?.fieldOrientation==="horizontal"?"horizontal":"vertical",
@@ -265,7 +273,12 @@ export class BocciaRoom extends DurableObject {
     await this.broadcast(payload);
   }
 
-  async syncPayload(knownRevision=null){
+  async syncPayload(knownRevision=null,knownMatchId=null){
+    const state=await this.getState();
+    if(knownMatchId&&knownMatchId!==state?.matchId){
+      if(!state)return{type:'restart',protocol:ONLINE_PROTOCOL,build:APP_BUILD};
+      return this.snapshotPayload();
+    }
     const revision=await this.getRevision();
     const known=Number(knownRevision);
 
@@ -275,7 +288,7 @@ export class BocciaRoom extends DurableObject {
       this.lastReplayPayload&&
       Number(this.lastReplayPayload.revision)===revision
     ){
-      return this.lastReplayPayload;
+      return {...this.lastReplayPayload,players:await this.playerList()};
     }
 
     if(Number.isFinite(known)&&known===revision){
@@ -439,7 +452,7 @@ export class BocciaRoom extends DurableObject {
     return{full:false,seats,side};
   }
 
-  async handleHttpJoin(data,clientKey){
+  async handleHttpJoin(data,clientKey,sessionId=null){
     if(data.protocol!==ONLINE_PROTOCOL||data.build!==APP_BUILD){
       return[{
         type:"room_state",
@@ -462,6 +475,7 @@ export class BocciaRoom extends DurableObject {
 
     const side=joined.side;
     const seat=joined.seats[side];
+    if(sessionId){seat.httpSessionId=sessionId;await this.ctx.storage.put("seats",joined.seats);}
 
     // HTTPS takeover replaces a stale native WebSocket belonging to the same
     // clientKey. This prevents the old transport from making the player look
@@ -503,7 +517,7 @@ export class BocciaRoom extends DurableObject {
     if(!data||typeof data!=="object")return[];
 
     if(data.type==="join"){
-      return this.handleHttpJoin(data,suppliedClientKey);
+      return this.handleHttpJoin(data,suppliedClientKey,String(body.sessionId||"").slice(0,160)||null);
     }
 
     const clientKey=suppliedClientKey;
@@ -523,6 +537,9 @@ export class BocciaRoom extends DurableObject {
     }
 
     const seat=seats[side];
+    if(body.sessionId&&seat.httpSessionId&&body.sessionId!==seat.httpSessionId){
+      return[{type:'session_replaced',protocol:ONLINE_PROTOCOL,build:APP_BUILD}];
+    }
     const player=this.touchHttpPresence(clientKey,side,seat.httpPlayerId||crypto.randomUUID());
     player.ready=!!seat.ready;
 
@@ -530,7 +547,7 @@ export class BocciaRoom extends DurableObject {
 
     if(data.type==="sync"){
       await this.maybeStartGame(null);
-      return[await this.syncPayload(data.knownRevision)];
+      return[await this.syncPayload(data.knownRevision,data.knownMatchId)];
     }
 
     if(data.type==="ready"){
@@ -639,7 +656,8 @@ export class BocciaRoom extends DurableObject {
     return[await this.roomStatePayload()];
   }
 
-  async webSocketMessage(ws,message){
+  webSocketMessage(ws,message){return this.serialize(()=>this.handleSocketMessage(ws,message));}
+  async handleSocketMessage(ws,message){
     let data;
     try{data=JSON.parse(message)}catch{return}
 
@@ -725,7 +743,7 @@ export class BocciaRoom extends DurableObject {
     if(activeSeats[player.side]?.clientKey!==player.clientKey)return;
 
     if(data.type==="sync"){
-      try{ws.send(JSON.stringify(await this.syncPayload(data.knownRevision)))}catch{}
+      try{ws.send(JSON.stringify(await this.syncPayload(data.knownRevision,data.knownMatchId)))}catch{}
       return;
     }
 
@@ -864,3 +882,4 @@ export class BocciaRoom extends DurableObject {
     await this.ctx.storage.setAlarm(Date.now()+EMPTY_ROOM_TTL_MS);
   }
 }
+
