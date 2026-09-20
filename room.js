@@ -1,8 +1,9 @@
+import {newClock,clockRemaining,nextClock,sideOf} from './match-clock.js';
 import { DurableObject } from "cloudflare:workers";
 import {
   APP_BUILD, ONLINE_PROTOCOL, EMPTY_ROOM_TTL_MS,
   cors, json, clone, makeRoomCode, createInitialState, setPhysicsProfile,
-  applyThrow, applySelectPlayer, applySelectBall, applyLauncher, applyDecline
+  applyThrow, applySelectPlayer, applySelectBall, applyLauncher, applyDecline, applyTimeExpired
 } from "./game-engine.js";
 
 const HTTP_CONNECTED_MS=15000;
@@ -27,7 +28,25 @@ export class BocciaRoom extends DurableObject {
   serialize(task){
     const work=this.commandQueue.then(task);this.commandQueue=work.catch(()=>{});return work;
   }
-  fetch(request){return this.serialize(()=>this.handleRequest(request));}
+  fetch(request){return this.serialize(async()=>{await this.expireClock();const response=await this.handleRequest(request);await this.armClock();return response;});}
+  async armClock(){
+    const s=await this.getState(),c=s?.clock;
+    if(c?.side)await this.ctx.storage.setAlarm(Math.max(Date.now()+20,c.activeAt+c.remaining[c.side]));
+  }
+  async expireClock(){
+    const s=await this.getState(),c=s?.clock,now=Date.now();
+    if(!c?.side||clockRemaining(c,c.side,now)>0)return;
+    const expired=c.side;
+    setPhysicsProfile(s.physicsProfile);
+    const result=applyTimeExpired(clone(s),expired);
+    result.state.clock=nextClock(s,result.state,now,0,result.transition);
+    const revision=(await this.getRevision())+1;
+    result.state.revision=revision;
+    await this.ctx.storage.put('gameState',result.state);await this.ctx.storage.put('revision',revision);
+    const payload=await this.snapshotPayload({action:'timeout',actor:expired,transition:result.transition});
+    this.lastReplayPayload=payload;await this.broadcast(payload);
+    await this.armClock();
+  }
   async handleRequest(request){
     const url=new URL(request.url);
 
@@ -40,6 +59,7 @@ export class BocciaRoom extends DurableObject {
       if(body.creationId)await this.ctx.storage.put('creationId',body.creationId);
       const config={
         matchFormat:"individual",
+        timedMode:!!body?.config?.timedMode,
         fieldOrientation:body?.config?.fieldOrientation==="horizontal"?"horizontal":"vertical",
         realisticMode:!!body?.config?.realisticMode,
         physicsProfile:{
@@ -202,6 +222,7 @@ export class BocciaRoom extends DurableObject {
       protocol:ONLINE_PROTOCOL,
       build:APP_BUILD,
       players:await this.playerList(),
+      clock:(await this.getState())?.clock||null,serverNow:Date.now(),
       config:await this.getConfig(),
       ...extra
     };
@@ -214,6 +235,7 @@ export class BocciaRoom extends DurableObject {
       build:APP_BUILD,
       revision:await this.getRevision(),
       state:await this.getState(),
+      clock:(await this.getState())?.clock||null,serverNow:Date.now(),
       players:await this.playerList(),
       config:await this.getConfig(),
       ...extra
@@ -264,6 +286,7 @@ export class BocciaRoom extends DurableObject {
     // start and that player can reconnect into the canonical server state.
     const initial=createInitialState(await this.getConfig());
     initial.revision=1;
+    if((await this.getConfig()).timedMode)initial.clock=newClock(initial);
 
     await this.ctx.storage.put("revision",1);
     await this.ctx.storage.put("gameState",initial);
@@ -288,7 +311,7 @@ export class BocciaRoom extends DurableObject {
       this.lastReplayPayload&&
       Number(this.lastReplayPayload.revision)===revision
     ){
-      return {...this.lastReplayPayload,players:await this.playerList()};
+      return {...this.lastReplayPayload,players:await this.playerList(),clock:state?.clock||null,serverNow:Date.now()};
     }
 
     if(Number.isFinite(known)&&known===revision){
@@ -328,6 +351,7 @@ export class BocciaRoom extends DurableObject {
     }
 
     const currentRevision=await this.getRevision();
+    if(state.clock&&Date.now()<state.clock.activeAt)return {payload:await this.snapshotPayload({ackActionId:actionId}),broadcast:false};
 
     if(data.matchId!==state.matchId||data.expectedRevision!==currentRevision){
       return{
@@ -392,6 +416,15 @@ export class BocciaRoom extends DurableObject {
       };
     }
 
+    if(state.clock){
+      const now=Date.now(),duration=(animation?.frames?.length||0)*1000/60;
+      next.clock=nextClock(state,next,now,duration,transition);
+      if(!transition&&next.clock.remaining[player.side]<=0&&['throw','decline'].includes(data.type)){
+        const expired=applyTimeExpired(next,player.side);next=expired.state;transition=expired.transition||transition;
+        if(transition)next.clock=newClock(next,now+duration+1450);
+        else next.clock.side=sideOf(next);
+      }
+    }
     const revision=(await this.getRevision())+1;
     next.revision=revision;
 
@@ -656,7 +689,7 @@ export class BocciaRoom extends DurableObject {
     return[await this.roomStatePayload()];
   }
 
-  webSocketMessage(ws,message){return this.serialize(()=>this.handleSocketMessage(ws,message));}
+  webSocketMessage(ws,message){return this.serialize(async()=>{await this.expireClock();await this.handleSocketMessage(ws,message);await this.armClock();});}
   async handleSocketMessage(ws,message){
     let data;
     try{data=JSON.parse(message)}catch{return}
@@ -844,12 +877,14 @@ export class BocciaRoom extends DurableObject {
 
     if(this.ctx.getWebSockets().length>0||this.httpPresence.size>0){
       try{await this.ctx.storage.deleteAlarm()}catch{}
+      await this.armClock();
       return;
     }
 
     const lastHttp=Number((await this.ctx.storage.get("lastHttpActivityAt"))||0);
     const base=Math.max(Date.now(),lastHttp);
     await this.ctx.storage.setAlarm(base+EMPTY_ROOM_TTL_MS);
+    await this.armClock();
   }
 
   async webSocketClose(ws){
@@ -864,7 +899,9 @@ export class BocciaRoom extends DurableObject {
     await this.scheduleCleanupIfEmpty();
   }
 
-  async alarm(){
+  alarm(){return this.serialize(()=>this.handleAlarm());}
+  async handleAlarm(){
+    await this.expireClock();
     this.pruneHttpPresence();
 
     const sockets=this.ctx.getWebSockets().length;
@@ -880,6 +917,6 @@ export class BocciaRoom extends DurableObject {
     }
 
     await this.ctx.storage.setAlarm(Date.now()+EMPTY_ROOM_TTL_MS);
+    await this.armClock();
   }
 }
-

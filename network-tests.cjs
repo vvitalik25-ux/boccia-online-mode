@@ -3,7 +3,8 @@ const c=vm.createContext({console,crypto,Response,Request,URL,TextEncoder,WebSoc
 let engine=fs.readFileSync(__dirname+'/game-engine.js','utf8').replace(/export \{[^}]+\};?/g,'');
 let room=fs.readFileSync(__dirname+'/room.js','utf8').replace(/import[\s\S]*?from ["'][^"']+["'];/g,'').replace('export class','class');
 let worker=fs.readFileSync(__dirname+'/worker.js','utf8').replace(/import[^\n]+\n/g,'').replace(/export \{[^\n]+\n/g,'').replace('export default','globalThis.worker=');
-vm.runInContext(engine+'\n'+room+'\nglobalThis.Room=BocciaRoom;\n'+worker,c);
+const clock=fs.readFileSync(__dirname+'/match-clock.js','utf8').replace(/export \{[^}]+\};?/g,'');
+vm.runInContext(engine+'\n'+clock+'\n'+room+'\nglobalThis.Room=BocciaRoom;\n'+worker,c);
 const rooms=new Map();function ctx(){const m=new Map();return{m,storage:{get:async k=>structuredClone(m.get(k)),put:async(k,v)=>m.set(k,structuredClone(v)),delete:async k=>m.delete(k),setAlarm:async()=>{},deleteAlarm:async()=>{},deleteAll:async()=>m.clear()},getWebSockets:()=>[],setWebSocketAutoResponse(){}}}
 const env={BOCCIA_ROOMS:{idFromName:s=>s,get(code){if(!rooms.has(code))rooms.set(code,new c.Room(ctx(),{}));return{fetch:r=>rooms.get(code).fetch(typeof r==='string'?new Request(r):r)}}}};
 const api=async(path,body)=>{const r=await c.worker.fetch(new Request('https://test'+path,body?{method:'POST',headers:{'Content-Type':'text/plain;charset=UTF-8'},body:JSON.stringify(body)}:{}),env);assert(r.ok,'HTTP '+r.status);return r.json()};

@@ -69,6 +69,7 @@ export default {
 
       const config={
         matchFormat:"individual",
+        timedMode:url.searchParams.get("timed")==="1",
         fieldOrientation:url.searchParams.get("orientation")==="horizontal"?"horizontal":"vertical",
         realisticMode:url.searchParams.get("realism")==="1",
         physicsProfile:{

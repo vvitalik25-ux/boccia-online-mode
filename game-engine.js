@@ -668,7 +668,21 @@ function applyDecline(s,side){
     transition:finishEnd(s)
   };
 }
+function applyTimeExpired(s,side){
+  for(const item of s.ballInventory[side])item.used=true;
+  setBallsLeft(s,side,0);
+  if(s.redLeft<=0&&s.blueLeft<=0){if(!s.jack)placeJackOnCross(s);return {state:s,transition:finishEnd(s)};}
+  if(currentSide(s)===side){
+    const other=opponent(side);
+    if(!s.jack){
+      s.currentJackBox=nextJackBoxAfter(s,s.currentJackBox);
+      while(sideForBox(s,s.currentJackBox)!==other)s.currentJackBox=nextJackBoxAfter(s,s.currentJackBox);
+      s.activePlayerBox[other]=s.currentJackBox;s.phase=sidePhase(other,'jack');
+    }else{s.phase=other;ensureActivePlayer(s,other);ensureSelectedBall(s,other);}
+  }
+  return {state:s,transition:null};
+}
 function makeRoomCode(){let out="";for(let i=0;i<5;i++)out+=ROOM_CHARS[Math.floor(Math.random()*ROOM_CHARS.length)];return out}
 
 
-export { APP_BUILD, ONLINE_PROTOCOL, EMPTY_ROOM_TTL_MS, cors, json, clone, makeRoomCode, createInitialState, setPhysicsProfile, applyThrow, applySelectPlayer, applySelectBall, applyLauncher, applyDecline };
+export { APP_BUILD, ONLINE_PROTOCOL, EMPTY_ROOM_TTL_MS, cors, json, clone, makeRoomCode, createInitialState, setPhysicsProfile, applyThrow, applySelectPlayer, applySelectBall, applyLauncher, applyDecline, applyTimeExpired };
